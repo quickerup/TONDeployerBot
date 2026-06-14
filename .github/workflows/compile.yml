@@ -12,15 +12,6 @@ on:
       callback_url:
         description: 'URL'
         required: true
-      chat_id:
-        description: 'Optional: Telegram chat ID'
-        required: false
-      owner_address:
-        description: 'Optional: Owner address for subsidized deploy'
-        required: false
-      deploy_value:
-        description: 'Optional: Deploy value'
-        required: false
   repository_dispatch:
     types: [compile_request]
 
@@ -31,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with: { node-version: '22' }
 
       - name: Install Compiler
         run: |
@@ -44,14 +35,8 @@ jobs:
           TACT_CODE: ${{ github.event.client_payload.code || github.event.inputs.code }}
           REQUEST_ID: ${{ github.event.client_payload.request_id || github.event.inputs.request_id }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
-          OWNER_ADDRESS: ${{ github.event.client_payload.owner_address || github.event.inputs.owner_address }}
-          DEPLOY_VALUE: ${{ github.event.client_payload.deploy_value || github.event.inputs.deploy_value }}
         run: |
-          # 1. Write the code safely
           printf "%s" "$TACT_CODE" > contract.tact
-          
-          # 2. Create the config file
           cat << 'EOF' > tact.config.json
           {
               "projects": [
@@ -63,37 +48,23 @@ jobs:
               ]
           }
           EOF
-          
-          # 3. Use the CLI
           npx tact --config tact.config.json
           
-          # 4. Process artifacts and handle callbacks/deployment
           cat << 'EOF' > callback.js
           const fs = require('fs');
           const path = require('path');
           const axios = require('axios');
-          const { beginCell, Cell, Address, toNano } = require('@ton/core');
-          const { TonClient, WalletContractV4 } = require('@ton/ton');
-          const { mnemonicToPrivateKey } = require('@ton/crypto');
 
           async function main() {
               const requestId = process.env.REQUEST_ID;
               const callbackUrl = process.env.CALLBACK_URL;
-              const chatId = process.env.CHAT_ID;
-              const ownerAddrStr = process.env.OWNER_ADDRESS;
-              const deployValueStr = process.env.DEPLOY_VALUE;
-              
-              // NEW FACTORY V2 ADDRESS
-              const FACTORY_V2 = "EQA-yLrlOmChs68HOrMrTDaL6euHXqlOiB2ohBUiMRq7HREx";
-
-              console.log(`Processing artifacts for request: ${requestId}`);
               
               const files = fs.readdirSync("./build");
               const codeBocFile = files.find(f => f.endsWith(".code.boc"));
               const pkgFile = files.find(f => f.endsWith(".pkg"));
 
               if (!codeBocFile || !pkgFile) {
-                  throw new Error(`Missing artifacts. Found: ${files.join(", ")}`);
+                  throw new Error("Missing artifacts.");
               }
 
               const codeBoc = fs.readFileSync(path.join("./build", codeBocFile)).toString("base64");
@@ -101,8 +72,6 @@ jobs:
               const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
               const abi = pkg.abi;
 
-              // Send callback to website
-              console.log("Sending success callback to Cloudflare...");
               await axios.post(callbackUrl, {
                   requestId,
                   success: true,
@@ -110,69 +79,10 @@ jobs:
                   dataBoc,
                   abi
               });
-
-              // Perform Subsidized Deployment if requested (Stars payment flow)
-              if (ownerAddrStr && ownerAddrStr !== "undefined") {
-                  console.log("Starting Subsidized Auto-Deployment...");
-                  const mnemonic = process.env.HOT_WALLET_MNEMONIC.split(" ");
-                  const key = await mnemonicToPrivateKey(mnemonic);
-                  const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
-                  
-                  const client = new TonClient({
-                      endpoint: 'https://toncenter.com/api/v2/jsonRPC',
-                      apiKey: process.env.TON_API_KEY
-                  });
-
-                  const walletProvider = client.open(wallet);
-                  const seqno = await walletProvider.getSeqno();
-
-                  // DeployChildSubsidized opcode: 1258154509
-                  const deployMsg = beginCell()
-                      .storeUint(1258154509, 32)
-                      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
-                      .storeRef(Cell.fromBase64(codeBoc))
-                      .storeRef(Cell.fromBase64(dataBoc))
-                      .storeBit(false) 
-                      .storeCoins(BigInt(deployValueStr || "100000000"))
-                      .endCell();
-
-                  await walletProvider.sendTransfer({
-                      secretKey: key.privateKey,
-                      seqno: seqno,
-                      messages: [{
-                          info: {
-                              type: 'internal',
-                              dest: Address.parse(FACTORY_V2),
-                              value: toNano("0.1"),
-                              bounce: false,
-                              ihrDisabled: true,
-                              bounced: false,
-                          },
-                          body: beginCell().storeRef(deployMsg).endCell()
-                      }],
-                      sendMode: 1
-                  });
-
-                  console.log("Deployment transaction sent!");
-
-                  if (chatId && chatId !== "undefined") {
-                      const botToken = process.env.TELEGRAM_BOT_TOKEN;
-                      const explorerLink = `https://tonviewer.com/${FACTORY_V2}`;
-                      await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                          chat_id: chatId,
-                          text: `🚀 <b>Contract Deployed!</b>\n\nYour contract has been subsidized and launched on Mainnet.\n\n🔗 <a href="https://tonviewer.com/${FACTORY_V2}">View Factory</a>`,
-                          parse_mode: 'HTML'
-                      });
-                  }
-              }
           }
           main().catch(err => { console.error(err); process.exit(1); });
           EOF
           node callback.js
-        env:
-          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
-          TON_API_KEY: ${{ secrets.TON_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
       - name: Failure Callback
         if: failure()
@@ -180,10 +90,4 @@ jobs:
           REQUEST_ID: ${{ github.event.client_payload.request_id || github.event.inputs.request_id }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
         run: |
-          node -e '
-          const axios = require("axios");
-          axios.post(process.env.CALLBACK_URL, { 
-              requestId: process.env.REQUEST_ID, 
-              success: false, 
-              error: "Cloud compilation failed or artifact mismatch." 
-          }).catch(() => {})'
+          node -e 'const axios = require("axios"); axios.post(process.env.CALLBACK_URL, { requestId: process.env.REQUEST_ID, success: false, error: "Cloud compilation failed." }).catch(() => {})'
