@@ -15,6 +15,12 @@ on:
       callback_url:
         description: 'URL to post the results back to'
         required: true
+      owner_address:
+        description: 'Optional: Owner address for subsidized deploy'
+        required: false
+      deploy_value:
+        description: 'Optional: Deploy value for subsidized deploy'
+        required: false
 
 jobs:
   build:
@@ -23,19 +29,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with: { node-version: '24' }
 
       - name: Install Compiler
         run: |
           npm init -y
-          npm install @tact-lang/compiler @ton/core @ton/ton @ton/crypto axios
+          npm install @tact-lang/compiler @ton/core @ton/ton @ton/crypto axios --ignore-scripts
 
       - name: Compile
         id: compile
         run: |
           cat << 'EOF' > builder.ts
           import fs from 'fs';
-          import { beginCell, Cell } from '@ton/core';
+          import { beginCell, Cell, Address, toNano } from '@ton/core';
+          import { TonClient, WalletContractV4 } from '@ton/ton';
+          import { mnemonicToPrivateKey } from '@ton/crypto';
           import { runTact } from '@tact-lang/compiler';
           import axios from 'axios';
 
@@ -43,6 +51,11 @@ jobs:
               const code = `${{ github.event.inputs.code }}`;
               const requestId = "${{ github.event.inputs.request_id }}";
               const callbackUrl = "${{ github.event.inputs.callback_url }}";
+              const chatId = "${{ github.event.inputs.chat_id }}";
+              const ownerAddrStr = "${{ github.event.inputs.owner_address }}";
+              const deployValueStr = "${{ github.event.inputs.deploy_value }}";
+
+              console.log("Starting Tact compilation...");
 
               const result = await runTact({
                   config: { projects: [{ name: "Contract", path: "./contract.tact", output: "./build" }] },
@@ -54,29 +67,95 @@ jobs:
                   }
               });
 
-              if (!result.success) throw new Error("Compilation failed");
+              if (!result.success) throw new Error("Tact compilation failed");
 
               const codeBoc = fs.readFileSync("./build/Contract_Contract.code.boc").toString("base64");
               const pkg = JSON.parse(fs.readFileSync("./build/Contract_Contract.pkg", "utf8"));
               const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
               const abi = pkg.abi;
 
-              // Send result back to Cloudflare
-              await axios.post(callbackUrl, {
-                  requestId,
-                  success: true,
-                  codeBoc,
-                  dataBoc,
-                  abi
-              });
+              console.log("Compilation successful.");
+
+              // Handle Callback for Website
+              if (callbackUrl && callbackUrl !== "undefined") {
+                  console.log("Sending callback to website...");
+                  await axios.post(callbackUrl, {
+                      requestId,
+                      success: true,
+                      codeBoc,
+                      dataBoc,
+                      abi
+                  });
+              }
+
+              // Handle Auto-Deploy for Bot (if owner_address is present)
+              if (ownerAddrStr && ownerAddrStr !== "undefined") {
+                  console.log("Starting Subsidized Auto-Deployment...");
+                  const mnemonic = process.env.HOT_WALLET_MNEMONIC!.split(" ");
+                  const key = await mnemonicToPrivateKey(mnemonic);
+                  const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
+                  
+                  const client = new TonClient({
+                      endpoint: 'https://toncenter.com/api/v2/jsonRPC',
+                      apiKey: process.env.TON_API_KEY
+                  });
+
+                  const walletProvider = client.open(wallet);
+                  const seqno = await walletProvider.getSeqno();
+
+                  // DeployChildSubsidized opcode: 1258154509
+                  const deployMsg = beginCell()
+                      .storeUint(1258154509, 32)
+                      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
+                      .storeRef(Cell.fromBase64(codeBoc))
+                      .storeRef(Cell.fromBase64(dataBoc))
+                      .storeBit(false) // No initMessage
+                      .storeCoins(BigInt(deployValueStr || "100000000"))
+                      .endCell();
+
+                  await walletProvider.sendTransfer({
+                      secretKey: key.privateKey,
+                      seqno: seqno,
+                      messages: [
+                          beginCell()
+                              .storeUint(0, 1)
+                              .storeAddress(Address.parse("EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"))
+                              .storeCoins(toNano("0.1"))
+                              .storeUint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                              .storeRef(deployMsg)
+                              .endCell()
+                      ],
+                      sendMode: 1
+                  });
+
+                  console.log("Deployment transaction sent!");
+
+                  if (chatId && chatId !== "undefined") {
+                      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+                      const explorerLink = `https://tonviewer.com/${Address.parse(ownerAddrStr).toString()}`;
+                      await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                          chat_id: chatId,
+                          text: `✅ <b>Contract Deployed!</b>\n\nYour contract has been successfully launched on Mainnet via Stars payment.\n\n🔗 <a href="${explorerLink}">View on Explorer</a>`,
+                          parse_mode: 'HTML'
+                      });
+                  }
+              }
           }
           run().catch(async (e) => {
-              await axios.post("${{ github.event.inputs.callback_url }}", {
-                  requestId: "${{ github.event.inputs.request_id }}",
-                  success: false,
-                  error: e.message
-              });
+              console.error(e);
+              const callbackUrl = "${{ github.event.inputs.callback_url }}";
+              if (callbackUrl && callbackUrl !== "undefined") {
+                  await axios.post(callbackUrl, {
+                      requestId: "${{ github.event.inputs.request_id }}",
+                      success: false,
+                      error: e.message
+                  });
+              }
               process.exit(1);
           });
           EOF
           npx ts-node builder.ts
+        env:
+          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
+          TON_API_KEY: ${{ secrets.TON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
