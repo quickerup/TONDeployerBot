@@ -12,6 +12,15 @@ on:
       callback_url:
         description: 'URL'
         required: true
+      chat_id:
+        description: 'Optional: Telegram chat ID'
+        required: false
+      owner_address:
+        description: 'Optional: Owner address for subsidized deploy'
+        required: false
+      deploy_value:
+        description: 'Optional: Deploy value'
+        required: false
   repository_dispatch:
     types: [compile_request]
 
@@ -35,6 +44,9 @@ jobs:
           TACT_CODE: ${{ github.event.client_payload.code || github.event.inputs.code }}
           REQUEST_ID: ${{ github.event.client_payload.request_id || github.event.inputs.request_id }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
+          OWNER_ADDRESS: ${{ github.event.client_payload.owner_address || github.event.inputs.owner_address }}
+          DEPLOY_VALUE: ${{ github.event.client_payload.deploy_value || github.event.inputs.deploy_value }}
         run: |
           printf "%s" "$TACT_CODE" > contract.tact
           cat << 'EOF' > tact.config.json
@@ -54,35 +66,133 @@ jobs:
           const fs = require('fs');
           const path = require('path');
           const axios = require('axios');
+          const { beginCell, Cell, Address, toNano } = require('@ton/core');
+          const { TonClient, WalletContractV4 } = require('@ton/ton');
+          const { mnemonicToPrivateKey } = require('@ton/crypto');
 
           async function main() {
               const requestId = process.env.REQUEST_ID;
               const callbackUrl = process.env.CALLBACK_URL;
+              const chatId = process.env.CHAT_ID;
+              const ownerAddrStr = process.env.OWNER_ADDRESS;
+              const deployValueStr = process.env.DEPLOY_VALUE;
+              
+              const FACTORY_V2 = "EQA-yLrlOmChs68HOrMrTDaL6euHXqlOiB2ohBUiMRq7HREx";
+
+              console.log(`Processing artifacts for request: ${requestId}`);
               
               const files = fs.readdirSync("./build");
               const codeBocFile = files.find(f => f.endsWith(".code.boc"));
               const pkgFile = files.find(f => f.endsWith(".pkg"));
 
               if (!codeBocFile || !pkgFile) {
-                  throw new Error("Missing artifacts.");
+                  throw new Error(`Missing artifacts. Found: ${files.join(", ")}`);
               }
 
-              const codeBoc = fs.readFileSync(path.join("./build", codeBocFile)).toString("base64");
+              const codeBocStr = fs.readFileSync(path.join("./build", codeBocFile)).toString("base64");
               const pkg = JSON.parse(fs.readFileSync(path.join("./build", pkgFile), "utf8"));
-              const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
+              const dataBocStr = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
               const abi = pkg.abi;
+              const name = pkg.name || "Contract";
 
-              await axios.post(callbackUrl, {
+              const codeCell = Cell.fromBase64(codeBocStr);
+              const dataCell = Cell.fromBase64(dataBocStr);
+              
+              // Predict Address
+              const stateInit = { code: codeCell, data: dataCell };
+              const deployedAddress = contractAddress(0, stateInit).toString();
+
+              let successData = {
                   requestId,
                   success: true,
-                  codeBoc,
-                  dataBoc,
-                  abi
-              });
+                  codeBoc: codeBocStr,
+                  dataBoc: dataBocStr,
+                  abi,
+                  deployedAddress,
+                  name,
+                  timestamp: Math.floor(Date.now() / 1000)
+              };
+
+              // Perform Subsidized Deployment if requested
+              if (ownerAddrStr && ownerAddrStr !== "undefined") {
+                  console.log("Starting Subsidized Auto-Deployment...");
+                  const mnemonic = process.env.HOT_WALLET_MNEMONIC.split(" ");
+                  const key = await mnemonicToPrivateKey(mnemonic);
+                  const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
+                  
+                  const client = new TonClient({
+                      endpoint: 'https://toncenter.com/api/v2/jsonRPC',
+                      apiKey: process.env.TON_API_KEY
+                  });
+
+                  const walletProvider = client.open(wallet);
+                  const seqno = await walletProvider.getSeqno();
+
+                  const deployMsg = beginCell()
+                      .storeUint(1258154509, 32)
+                      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
+                      .storeRef(codeCell)
+                      .storeRef(dataCell)
+                      .storeBit(false) 
+                      .storeCoins(BigInt(deployValueStr || "100000000"))
+                      .endCell();
+
+                  await walletProvider.sendTransfer({
+                      secretKey: key.privateKey,
+                      seqno: seqno,
+                      messages: [{
+                          info: {
+                              type: 'internal',
+                              dest: Address.parse(FACTORY_V2),
+                              value: toNano("0.1"),
+                              bounce: false,
+                              ihrDisabled: true,
+                              bounced: false,
+                          },
+                          body: beginCell().storeRef(deployMsg).endCell()
+                      }],
+                      sendMode: 1
+                  });
+
+                  console.log("Deployment transaction sent!");
+
+                  if (chatId && chatId !== "undefined") {
+                      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+                      const explorerLink = `https://tonviewer.com/${deployedAddress}`;
+                      await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                          chat_id: chatId,
+                          text: `🚀 <b>Contract Deployed!</b>\n\nYour contract has been subsidized and launched on Mainnet.\n\n🔗 <a href="${explorerLink}">View Contract</a>`,
+                          parse_mode: 'HTML'
+                      });
+                  }
+              }
+
+              // Send callback to website
+              console.log("Sending success callback...");
+              await axios.post(callbackUrl, successData);
           }
+
+          function contractAddress(workchain, init) {
+              const { code, data } = init;
+              const hash = beginCell()
+                  .storeUint(0, 2)
+                  .storeBit(false)
+                  .storeBit(false)
+                  .storeBit(false)
+                  .storeRef(code)
+                  .storeRef(data)
+                  .endCell()
+                  .hash();
+              return new Address(workchain, hash);
+          }
+
           main().catch(err => { console.error(err); process.exit(1); });
           EOF
           node callback.js
+        env:
+          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
+          TON_API_KEY: ${{ secrets.TON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
       - name: Failure Callback
         if: failure()
@@ -90,4 +200,10 @@ jobs:
           REQUEST_ID: ${{ github.event.client_payload.request_id || github.event.inputs.request_id }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
         run: |
-          node -e 'const axios = require("axios"); axios.post(process.env.CALLBACK_URL, { requestId: process.env.REQUEST_ID, success: false, error: "Cloud compilation failed." }).catch(() => {})'
+          node -e '
+          const axios = require("axios");
+          axios.post(process.env.CALLBACK_URL, { 
+              requestId: process.env.REQUEST_ID, 
+              success: false, 
+              error: "Cloud compilation failed or artifact mismatch." 
+          }).catch(() => {})'
