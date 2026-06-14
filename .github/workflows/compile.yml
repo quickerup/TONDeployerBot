@@ -29,25 +29,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
-        with: { node-version: '24' }
+        with: { node-version: '20' }
 
       - name: Install Compiler
         run: |
           npm init -y
-          npm install @tact-lang/compiler @ton/core @ton/ton @ton/crypto axios --ignore-scripts
+          npm install @tact-lang/compiler@1.6.13 @ton/core @ton/ton @ton/crypto axios --ignore-scripts
 
       - name: Compile
         id: compile
         run: |
-          cat << 'EOF' > builder.ts
-          import fs from 'fs';
-          import { beginCell, Cell, Address, toNano } from '@ton/core';
-          import { TonClient, WalletContractV4 } from '@ton/ton';
-          import { mnemonicToPrivateKey } from '@ton/crypto';
-          import { runTact } from '@tact-lang/compiler';
-          import axios from 'axios';
+          cat << 'EOF' > builder.js
+          const fs = require('fs');
+          const { beginCell, Cell, Address, toNano } = require('@ton/core');
+          const { TonClient, WalletContractV4 } = require('@ton/ton');
+          const { mnemonicToPrivateKey } = require('@ton/crypto');
+          const { run } = require('@tact-lang/compiler');
+          const axios = require('axios');
 
-          async function run() {
+          async function main() {
               const code = `${{ github.event.inputs.code }}`;
               const requestId = "${{ github.event.inputs.request_id }}";
               const callbackUrl = "${{ github.event.inputs.callback_url }}";
@@ -57,7 +57,7 @@ jobs:
 
               console.log("Starting Tact compilation...");
 
-              const result = await runTact({
+              const result = await run({
                   config: { projects: [{ name: "Contract", path: "./contract.tact", output: "./build" }] },
                   fs: {
                       readFile: (path) => path === "./contract.tact" ? Buffer.from(code) : fs.readFileSync(path),
@@ -77,7 +77,7 @@ jobs:
               console.log("Compilation successful.");
 
               // Handle Callback for Website
-              if (callbackUrl && callbackUrl !== "undefined") {
+              if (callbackUrl && callbackUrl !== "undefined" && callbackUrl !== "") {
                   console.log("Sending callback to website...");
                   await axios.post(callbackUrl, {
                       requestId,
@@ -88,10 +88,10 @@ jobs:
                   });
               }
 
-              // Handle Auto-Deploy for Bot (if owner_address is present)
-              if (ownerAddrStr && ownerAddrStr !== "undefined") {
+              // Handle Auto-Deploy for Bot
+              if (ownerAddrStr && ownerAddrStr !== "undefined" && ownerAddrStr !== "") {
                   console.log("Starting Subsidized Auto-Deployment...");
-                  const mnemonic = process.env.HOT_WALLET_MNEMONIC!.split(" ");
+                  const mnemonic = process.env.HOT_WALLET_MNEMONIC.split(" ");
                   const key = await mnemonicToPrivateKey(mnemonic);
                   const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
                   
@@ -109,7 +109,7 @@ jobs:
                       .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
                       .storeRef(Cell.fromBase64(codeBoc))
                       .storeRef(Cell.fromBase64(dataBoc))
-                      .storeBit(false) // No initMessage
+                      .storeBit(false) 
                       .storeCoins(BigInt(deployValueStr || "100000000"))
                       .endCell();
 
@@ -117,20 +117,24 @@ jobs:
                       secretKey: key.privateKey,
                       seqno: seqno,
                       messages: [
-                          beginCell()
-                              .storeUint(0, 1)
-                              .storeAddress(Address.parse("EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"))
-                              .storeCoins(toNano("0.1"))
-                              .storeUint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
-                              .storeRef(deployMsg)
-                              .endCell()
+                          {
+                              info: {
+                                  type: 'internal',
+                                  dest: Address.parse("EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"),
+                                  value: toNano("0.1"),
+                                  bounce: false,
+                                  ihrDisabled: true,
+                                  bounced: false,
+                              },
+                              body: beginCell().storeRef(deployMsg).endCell()
+                          }
                       ],
                       sendMode: 1
                   });
 
                   console.log("Deployment transaction sent!");
 
-                  if (chatId && chatId !== "undefined") {
+                  if (chatId && chatId !== "undefined" && chatId !== "") {
                       const botToken = process.env.TELEGRAM_BOT_TOKEN;
                       const explorerLink = `https://tonviewer.com/${Address.parse(ownerAddrStr).toString()}`;
                       await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -141,10 +145,10 @@ jobs:
                   }
               }
           }
-          run().catch(async (e) => {
+          main().catch(async (e) => {
               console.error(e);
               const callbackUrl = "${{ github.event.inputs.callback_url }}";
-              if (callbackUrl && callbackUrl !== "undefined") {
+              if (callbackUrl && callbackUrl !== "undefined" && callbackUrl !== "") {
                   await axios.post(callbackUrl, {
                       requestId: "${{ github.event.inputs.request_id }}",
                       success: false,
@@ -154,7 +158,7 @@ jobs:
               process.exit(1);
           });
           EOF
-          npx ts-node builder.ts
+          node builder.js
         env:
           HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
           TON_API_KEY: ${{ secrets.TON_API_KEY }}
