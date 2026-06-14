@@ -1,0 +1,11 @@
+name: Hello World Dispatch
+
+on:
+  repository_dispatch:
+    types: [hello_world]
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "DISPATCH RECEIVED SUCCESSFULLY"
