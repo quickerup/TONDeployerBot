@@ -39,44 +39,45 @@ jobs:
       - name: Compile
         id: compile
         run: |
-          cat << 'EOF' > builder.js
+          # 1. Write the code to a file
+          echo "${{ github.event.inputs.code }}" > contract.tact
+          
+          # 2. Create the config file
+          cat << 'EOF' > tact.config.json
+          {
+              "projects": [
+                  {
+                      "name": "Contract",
+                      "path": "./contract.tact",
+                      "output": "./build"
+                  }
+              ]
+          }
+          EOF
+          
+          # 3. Use the CLI instead of the API for reliability
+          npx tact --config tact.config.json
+          
+          # 4. Process artifacts and handle callbacks
+          cat << 'EOF' > callback.js
           const fs = require('fs');
+          const axios = require('axios');
           const { beginCell, Cell, Address, toNano } = require('@ton/core');
           const { TonClient, WalletContractV4 } = require('@ton/ton');
           const { mnemonicToPrivateKey } = require('@ton/crypto');
-          const { run } = require('@tact-lang/compiler');
-          const axios = require('axios');
 
           async function main() {
-              const code = `${{ github.event.inputs.code }}`;
               const requestId = "${{ github.event.inputs.request_id }}";
               const callbackUrl = "${{ github.event.inputs.callback_url }}";
               const chatId = "${{ github.event.inputs.chat_id }}";
               const ownerAddrStr = "${{ github.event.inputs.owner_address }}";
               const deployValueStr = "${{ github.event.inputs.deploy_value }}";
 
-              console.log("Starting Tact compilation...");
-
-              const result = await run({
-                  config: { projects: [{ name: "Contract", path: "./contract.tact", output: "./build" }] },
-                  fs: {
-                      readFile: (path) => path === "./contract.tact" ? Buffer.from(code) : fs.readFileSync(path),
-                      writeFile: (path, data) => fs.writeFileSync(path, data),
-                      mkdir: (path) => fs.mkdirSync(path, { recursive: true }),
-                      exists: (path) => fs.existsSync(path),
-                  }
-              });
-
-              if (!result.success) throw new Error("Tact compilation failed");
-
               const codeBoc = fs.readFileSync("./build/Contract_Contract.code.boc").toString("base64");
               const pkg = JSON.parse(fs.readFileSync("./build/Contract_Contract.pkg", "utf8"));
               const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
               const abi = pkg.abi;
 
-              console.log("Compilation successful.");
-
-              // Handle Callback for Website
               if (callbackUrl && callbackUrl !== "undefined" && callbackUrl !== "") {
                   console.log("Sending callback to website...");
                   await axios.post(callbackUrl, {
@@ -88,7 +89,6 @@ jobs:
                   });
               }
 
-              // Handle Auto-Deploy for Bot
               if (ownerAddrStr && ownerAddrStr !== "undefined" && ownerAddrStr !== "") {
                   console.log("Starting Subsidized Auto-Deployment...");
                   const mnemonic = process.env.HOT_WALLET_MNEMONIC.split(" ");
@@ -103,7 +103,6 @@ jobs:
                   const walletProvider = client.open(wallet);
                   const seqno = await walletProvider.getSeqno();
 
-                  // DeployChildSubsidized opcode: 1258154509
                   const deployMsg = beginCell()
                       .storeUint(1258154509, 32)
                       .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
@@ -116,19 +115,17 @@ jobs:
                   await walletProvider.sendTransfer({
                       secretKey: key.privateKey,
                       seqno: seqno,
-                      messages: [
-                          {
-                              info: {
-                                  type: 'internal',
-                                  dest: Address.parse("EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"),
-                                  value: toNano("0.1"),
-                                  bounce: false,
-                                  ihrDisabled: true,
-                                  bounced: false,
-                              },
-                              body: beginCell().storeRef(deployMsg).endCell()
-                          }
-                      ],
+                      messages: [{
+                          info: {
+                              type: 'internal',
+                              dest: Address.parse("EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"),
+                              value: toNano("0.1"),
+                              bounce: false,
+                              ihrDisabled: true,
+                              bounced: false,
+                          },
+                          body: beginCell().storeRef(deployMsg).endCell()
+                      }],
                       sendMode: 1
                   });
 
@@ -139,27 +136,21 @@ jobs:
                       const explorerLink = `https://tonviewer.com/${Address.parse(ownerAddrStr).toString()}`;
                       await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
                           chat_id: chatId,
-                          text: `✅ <b>Contract Deployed!</b>\n\nYour contract has been successfully launched on Mainnet via Stars payment.\n\n🔗 <a href="${explorerLink}">View on Explorer</a>`,
+                          text: `✅ <b>Contract Deployed!</b>\n\nYour contract has been successfully launched on Mainnet.\n\n🔗 <a href="${explorerLink}">View on Explorer</a>`,
                           parse_mode: 'HTML'
                       });
                   }
               }
           }
-          main().catch(async (e) => {
-              console.error(e);
-              const callbackUrl = "${{ github.event.inputs.callback_url }}";
-              if (callbackUrl && callbackUrl !== "undefined" && callbackUrl !== "") {
-                  await axios.post(callbackUrl, {
-                      requestId: "${{ github.event.inputs.request_id }}",
-                      success: false,
-                      error: e.message
-                  });
-              }
-              process.exit(1);
-          });
+          main().catch(err => { console.error(err); process.exit(1); });
           EOF
-          node builder.js
+          node callback.js
         env:
           HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
           TON_API_KEY: ${{ secrets.TON_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Failure Callback
+        if: failure()
+        run: |
+          node -e 'const axios = require("axios"); axios.post("${{ github.event.inputs.callback_url }}", { requestId: "${{ github.event.inputs.request_id }}", success: false, error: "Cloud compilation failed." }).catch(() => {})'
