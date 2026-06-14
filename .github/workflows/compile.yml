@@ -18,9 +18,6 @@ on:
       owner_address:
         description: 'Optional: Owner address for subsidized deploy'
         required: false
-      deploy_value:
-        description: 'Optional: Deploy value'
-        required: false
   repository_dispatch:
     types: [compile_request]
 
@@ -46,7 +43,6 @@ jobs:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
           CHAT_ID: ${{ github.event.client_payload.chat_id || github.event.inputs.chat_id }}
           OWNER_ADDRESS: ${{ github.event.client_payload.owner_address || github.event.inputs.owner_address }}
-          DEPLOY_VALUE: ${{ github.event.client_payload.deploy_value || github.event.inputs.deploy_value }}
         run: |
           printf "%s" "$TACT_CODE" > contract.tact
           cat << 'EOF' > tact.config.json
@@ -75,9 +71,10 @@ jobs:
               const callbackUrl = process.env.CALLBACK_URL;
               const chatId = process.env.CHAT_ID;
               const ownerAddrStr = process.env.OWNER_ADDRESS;
-              const deployValueStr = process.env.DEPLOY_VALUE;
               
               const FACTORY_V2 = "EQA-yLrlOmChs68HOrMrTDaL6euHXqlOiB2ohBUiMRq7HREx";
+              // FIXED DEPLOY VALUE (0.1 TON) to prevent treasury drain
+              const SAFE_DEPLOY_VALUE = toNano("0.1");
 
               console.log(`Processing artifacts for request: ${requestId}`);
               
@@ -86,7 +83,7 @@ jobs:
               const pkgFile = files.find(f => f.endsWith(".pkg"));
 
               if (!codeBocFile || !pkgFile) {
-                  throw new Error(`Missing artifacts. Found: ${files.join(", ")}`);
+                  throw new Error(`Missing artifacts.`);
               }
 
               const codeBocStr = fs.readFileSync(path.join("./build", codeBocFile)).toString("base64");
@@ -98,7 +95,6 @@ jobs:
               const codeCell = Cell.fromBase64(codeBocStr);
               const dataCell = Cell.fromBase64(dataBocStr);
               
-              // Predict Address
               const stateInit = { code: codeCell, data: dataCell };
               const deployedAddress = contractAddress(0, stateInit).toString();
 
@@ -113,7 +109,6 @@ jobs:
                   timestamp: Math.floor(Date.now() / 1000)
               };
 
-              // Perform Subsidized Deployment if requested
               if (ownerAddrStr && ownerAddrStr !== "undefined") {
                   console.log("Starting Subsidized Auto-Deployment...");
                   const mnemonic = process.env.HOT_WALLET_MNEMONIC.split(" ");
@@ -134,7 +129,7 @@ jobs:
                       .storeRef(codeCell)
                       .storeRef(dataCell)
                       .storeBit(false) 
-                      .storeCoins(BigInt(deployValueStr || "100000000"))
+                      .storeCoins(SAFE_DEPLOY_VALUE)
                       .endCell();
 
                   await walletProvider.sendTransfer({
@@ -144,7 +139,7 @@ jobs:
                           info: {
                               type: 'internal',
                               dest: Address.parse(FACTORY_V2),
-                              value: toNano("0.1"),
+                              value: toNano("0.05"),
                               bounce: false,
                               ihrDisabled: true,
                               bounced: false,
@@ -167,7 +162,6 @@ jobs:
                   }
               }
 
-              // Send callback to website
               console.log("Sending success callback...");
               await axios.post(callbackUrl, successData);
           }
