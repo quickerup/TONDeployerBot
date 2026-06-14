@@ -6,66 +6,46 @@ on:
       code:
         description: 'Tact source code'
         required: true
-      owner_address:
-        description: 'Owner address for the child contract'
-        required: true
-      deploy_value:
-        description: 'Initial balance for the child contract (in nanoTON)'
-        required: true
-      name:
-        description: 'Alias for the contract'
-        required: true
       chat_id:
-        description: 'Telegram chat ID to notify'
+        description: 'Optional: Telegram chat ID to notify'
+        required: false
+      request_id:
+        description: 'Unique ID to track this build'
+        required: true
+      callback_url:
+        description: 'URL to post the results back to'
         required: true
 
 jobs:
-  compile-and-deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        with: { node-version: '20' }
 
-      - name: Install dependencies
+      - name: Install Compiler
         run: |
           npm init -y
-          npm install @tact-lang/compiler @ton/ton @ton/core @ton/crypto buffer axios
+          npm install @tact-lang/compiler @ton/core @ton/ton @ton/crypto axios
 
-      - name: Compile and Deploy
-        env:
-          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
-          FACTORY_ADDRESS: "EQBHjc_e5d62vZWk7p68-0Hz0VBSDE9tLVNnZiNBPtqy41IT"
-          TON_API_KEY: ${{ secrets.TON_API_KEY }}
+      - name: Compile
+        id: compile
         run: |
-          cat << 'EOF' > deploy_script.ts
+          cat << 'EOF' > builder.ts
           import fs from 'fs';
-          import { Address, Cell, beginCell, toNano, storeStateInit } from '@ton/core';
-          import { TonClient, WalletContractV4 } from '@ton/ton';
-          import { mnemonicToPrivateKey } from '@ton/crypto';
+          import { beginCell, Cell } from '@ton/core';
           import { runTact } from '@tact-lang/compiler';
           import axios from 'axios';
 
           async function run() {
               const code = `${{ github.event.inputs.code }}`;
-              const ownerAddr = Address.parse("${{ github.event.inputs.owner_address }}");
-              const deployValue = BigInt("${{ github.event.inputs.deploy_value }}");
-              const chatId = "${{ github.event.inputs.chat_id }}";
+              const requestId = "${{ github.event.inputs.request_id }}";
+              const callbackUrl = "${{ github.event.inputs.callback_url }}";
 
-              console.log("Starting Tact compilation...");
-              
-              // 1. Compile Code
               const result = await runTact({
-                  config: {
-                      projects: [{
-                          name: "Contract",
-                          path: "./contract.tact",
-                          output: "./build",
-                      }]
-                  },
+                  config: { projects: [{ name: "Contract", path: "./contract.tact", output: "./build" }] },
                   fs: {
                       readFile: (path) => path === "./contract.tact" ? Buffer.from(code) : fs.readFileSync(path),
                       writeFile: (path, data) => fs.writeFileSync(path, data),
@@ -74,77 +54,29 @@ jobs:
                   }
               });
 
-              if (!result.success) {
-                  throw new Error("Tact compilation failed");
-              }
+              if (!result.success) throw new Error("Compilation failed");
 
-              const codeBoc = fs.readFileSync("./build/Contract_Contract.code.boc");
+              const codeBoc = fs.readFileSync("./build/Contract_Contract.code.boc").toString("base64");
               const pkg = JSON.parse(fs.readFileSync("./build/Contract_Contract.pkg", "utf8"));
-              const dataBoc = pkg.data ? Buffer.from(pkg.data, "base64") : beginCell().storeBit(0).endCell().toBoc();
+              const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
+              const abi = pkg.abi;
 
-              console.log("Compilation successful. Connecting to TON...");
-
-              // 2. Setup Hot Wallet
-              const mnemonic = process.env.HOT_WALLET_MNEMONIC!.split(" ");
-              const key = await mnemonicToPrivateKey(mnemonic);
-              const wallet = WalletContractV4.create({ publicKey: key.publicKey, workchain: 0 });
-              
-              const client = new TonClient({
-                  endpoint: 'https://toncenter.com/api/v2/jsonRPC',
-                  apiKey: process.env.TON_API_KEY
-              });
-
-              const walletProvider = client.open(wallet);
-              const seqno = await walletProvider.getSeqno();
-
-              // 3. Construct DeployChildSubsidized message
-              // Opcode for DeployChildSubsidized is 0x6e78749e (guessed from previous, need to verify)
-              // Actually, I'll calculate it from the message name
-              // message DeployChildSubsidized { queryId: uint64, code: Cell, data: Cell, initMessage: Cell?, deployValue: coins }
-              
-              const deployMsg = beginCell()
-                  .storeUint(0x6e78749e, 32) // We should probably use the actual opcode or a better way
-                  .storeUint(Math.floor(Date.now() / 1000), 64)
-                  .storeRef(Cell.fromBoc(codeBoc)[0])
-                  .storeRef(Cell.fromBoc(dataBoc)[0])
-                  .storeBit(false) // No initMessage
-                  .storeCoins(deployValue)
-                  .endCell();
-
-              console.log("Sending subsidized deployment to Factory...");
-
-              await walletProvider.sendTransfer({
-                  secretKey: key.privateKey,
-                  seqno: seqno,
-                  messages: [
-                      beginCell()
-                          .storeUint(0, 1) // internal message
-                          .storeAddress(Address.parse(process.env.FACTORY_ADDRESS!))
-                          .storeCoins(toNano("0.1")) // Gas for the factory
-                          .storeUint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
-                          .storeRef(deployMsg)
-                          .endCell()
-                  ],
-                  sendMode: 1
-              });
-
-              console.log("Transaction sent!");
-              
-              // 4. Notify user via Telegram
-              // We call the Telegram API directly from the action
-              const botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}";
-              const explorerLink = `https://tonviewer.com/${ownerAddr.toString()}`; // Simple link to owner for now, or we compute child
-              
-              await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                  chat_id: chatId,
-                  text: `✅ <b>Contract Deployed!</b>\n\nYour contract has been successfully launched on Mainnet.\n\n🔗 <a href="${explorerLink}">View on Explorer</a>`,
-                  parse_mode: 'HTML'
+              // Send result back to Cloudflare
+              await axios.post(callbackUrl, {
+                  requestId,
+                  success: true,
+                  codeBoc,
+                  dataBoc,
+                  abi
               });
           }
-
-          run().catch(err => {
-              console.error(err);
+          run().catch(async (e) => {
+              await axios.post("${{ github.event.inputs.callback_url }}", {
+                  requestId: "${{ github.event.inputs.request_id }}",
+                  success: false,
+                  error: e.message
+              });
               process.exit(1);
           });
           EOF
-          npx ts-node deploy_script.ts
+          npx ts-node builder.ts
