@@ -32,12 +32,11 @@ jobs:
       - name: Compile
         id: compile
         env:
-          # Use client_payload if repository_dispatch, else inputs
           TACT_CODE: ${{ github.event.client_payload.code || github.event.inputs.code }}
           REQUEST_ID: ${{ github.event.client_payload.request_id || github.event.inputs.request_id }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url || github.event.inputs.callback_url }}
         run: |
-          # 1. Write the code safely (using env var to avoid shell stripping)
+          # 1. Write the code safely
           printf "%s" "$TACT_CODE" > contract.tact
           
           # 2. Create the config file
@@ -56,35 +55,41 @@ jobs:
           # 3. Use the CLI
           npx tact --config tact.config.json
           
-          # 4. Process artifacts and handle callbacks
+          # 4. Process artifacts and handle callbacks (Dynamic File Lookup)
           cat << 'EOF' > callback.js
           const fs = require('fs');
+          const path = require('path');
           const axios = require('axios');
 
           async function main() {
               const requestId = process.env.REQUEST_ID;
               const callbackUrl = process.env.CALLBACK_URL;
 
-              console.log(`Processing artifacts for request: ${requestId}`);
+              console.log(`Searching for artifacts in ./build ...`);
+              
+              const files = fs.readdirSync("./build");
+              const codeBocFile = files.find(f => f.endsWith(".code.boc"));
+              const pkgFile = files.find(f => f.endsWith(".pkg"));
 
-              try {
-                  const codeBoc = fs.readFileSync("./build/Contract_Contract.code.boc").toString("base64");
-                  const pkg = JSON.parse(fs.readFileSync("./build/Contract_Contract.pkg", "utf8"));
-                  const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
-                  const abi = pkg.abi;
-
-                  console.log("Sending success callback...");
-                  await axios.post(callbackUrl, {
-                      requestId,
-                      success: true,
-                      codeBoc,
-                      dataBoc,
-                      abi
-                  });
-              } catch (e) {
-                  console.error("Failed to read artifacts:", e.message);
-                  throw e;
+              if (!codeBocFile || !pkgFile) {
+                  throw new Error(`Missing artifacts. Found: ${files.join(", ")}`);
               }
+
+              console.log(`Using artifacts: ${codeBocFile} and ${pkgFile}`);
+
+              const codeBoc = fs.readFileSync(path.join("./build", codeBocFile)).toString("base64");
+              const pkg = JSON.parse(fs.readFileSync(path.join("./build", pkgFile), "utf8"));
+              const dataBoc = pkg.data || "te6cckEBAQEAAwAAAUD20kA0";
+              const abi = pkg.abi;
+
+              console.log("Sending success callback...");
+              await axios.post(callbackUrl, {
+                  requestId,
+                  success: true,
+                  codeBoc,
+                  dataBoc,
+                  abi
+              });
           }
           main().catch(err => { console.error(err); process.exit(1); });
           EOF
@@ -101,5 +106,5 @@ jobs:
           axios.post(process.env.CALLBACK_URL, { 
               requestId: process.env.REQUEST_ID, 
               success: false, 
-              error: "Cloud compilation failed. Check GitHub Action logs for syntax errors." 
+              error: "Cloud compilation failed or artifact mismatch. Check Action logs." 
           }).catch(() => {})'
