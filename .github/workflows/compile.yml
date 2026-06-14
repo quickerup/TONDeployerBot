@@ -38,9 +38,11 @@ jobs:
 
       - name: Compile
         id: compile
+        env:
+          TACT_CODE: ${{ github.event.inputs.code }}
         run: |
-          # 1. Write the code to a file
-          echo "${{ github.event.inputs.code }}" > contract.tact
+          # 1. Write the code safely to a file
+          echo "$TACT_CODE" > contract.tact
           
           # 2. Create the config file
           cat << 'EOF' > tact.config.json
@@ -55,7 +57,7 @@ jobs:
           }
           EOF
           
-          # 3. Use the CLI instead of the API for reliability
+          # 3. Use the CLI
           npx tact --config tact.config.json
           
           # 4. Process artifacts and handle callbacks
