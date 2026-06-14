@@ -40,6 +40,9 @@ jobs:
         id: compile
         env:
           TACT_CODE: ${{ github.event.inputs.code }}
+          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
+          TON_API_KEY: ${{ secrets.TON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           # 1. Write the code safely to a file
           echo "$TACT_CODE" > contract.tact
@@ -147,10 +150,6 @@ jobs:
           main().catch(err => { console.error(err); process.exit(1); });
           EOF
           node callback.js
-        env:
-          HOT_WALLET_MNEMONIC: ${{ secrets.HOT_WALLET_MNEMONIC }}
-          TON_API_KEY: ${{ secrets.TON_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
       - name: Failure Callback
         if: failure()
